@@ -150,6 +150,28 @@ public final class SplatRenderer: @unchecked Sendable {
         set { sorter.onSortComplete = newValue }
     }
 
+    /// A camera pose the depth sort is computed for.
+    public struct SortPose: Sendable, Equatable {
+        public var position: SIMD3<Float>
+        public var forward: SIMD3<Float>
+
+        public init(position: SIMD3<Float>, forward: SIMD3<Float>) {
+            self.position = position
+            self.forward = forward
+        }
+    }
+
+    /// Decides whether a render's camera pose needs a new depth sort, given the pose the last sort started with. Nil
+    /// (the default) sorts for every render. Chunk changes and `afterNextSort` always sort. Called on the rendering
+    /// thread under the sorter's lock: keep it cheap and pure.
+    public var sortPoseFilter: (@Sendable (_ lastSorted: SortPose, _ current: SortPose) -> Bool)? {
+        get { sorter.sortPoseFilter }
+        set { sorter.sortPoseFilter = newValue }
+    }
+
+    /// Whether the depth sort orders splats by distance from the camera position (true) or along the view direction.
+    public static var sortsByDistance: Bool { Constants.sortByDistance }
+
     private let library: MTLLibrary
 
     // MARK: - Chunk Storage

@@ -440,4 +440,95 @@ extension SplatSorterTests {
             group.cancelAll()
         }
     }
+
+    // MARK: - Pose filter
+
+    private final class SortCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var n = 0
+        func add() { lock.lock(); n += 1; lock.unlock() }
+        var count: Int { lock.lock(); defer { lock.unlock() }; return n }
+    }
+
+    /// Polls `condition` until it holds or `seconds` pass.
+    private func eventually(_ seconds: Double = 2, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        return condition()
+    }
+
+    private func makeSorter(filter: (@Sendable (SplatRenderer.SortPose, SplatRenderer.SortPose) -> Bool)?,
+                            counting sorts: SortCounter) throws -> SplatSorter {
+        let sorter = try SplatSorter(device: device)
+        sorter.onSortComplete = { _ in sorts.add() }
+        sorter.sortPoseFilter = filter
+        return sorter
+    }
+
+    func testPoseFilterSkipsSortsItRejects() async throws {
+        let sorts = SortCounter()
+        let sorter = try makeSorter(filter: { last, current in simd_distance(last.position, current.position) >= 0.1 },
+                                    counting: sorts)
+        sorter.setChunks([try makeChunkReference(positions: [SIMD3(-5, 0, 0), SIMD3(5, 0, 0)], chunkIndex: 0)])
+        let first = await eventually { sorts.count == 1 }
+        XCTAssertTrue(first)
+        sorter.updateCameraPose(position: SIMD3(0.05, 0, 0), forward: SIMD3(0, 0, -1))
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(sorts.count, 1, "a move below the threshold does not sort")
+        sorter.updateCameraPose(position: SIMD3(0.5, 0, 0), forward: SIMD3(0, 0, -1))
+        let second = await eventually { sorts.count == 2 }
+        XCTAssertTrue(second, "a move beyond the threshold sorts")
+    }
+
+    func testPoseFilterMeasuresFromTheLastSortedPose() async throws {
+        let sorts = SortCounter()
+        let sorter = try makeSorter(filter: { last, current in simd_distance(last.position, current.position) >= 0.1 },
+                                    counting: sorts)
+        sorter.setChunks([try makeChunkReference(positions: [SIMD3(-5, 0, 0), SIMD3(5, 0, 0)], chunkIndex: 0)])
+        let first = await eventually { sorts.count == 1 }
+        XCTAssertTrue(first)
+        // Steps of 4 cm: each is below the threshold from the previous pose, the third is beyond it from the sorted one.
+        for i in 1...3 { sorter.updateCameraPose(position: SIMD3(Float(i) * 0.04, 0, 0), forward: SIMD3(0, 0, -1)) }
+        let second = await eventually { sorts.count == 2 }
+        XCTAssertTrue(second)
+    }
+
+    func testChunkChangeSortsWhateverTheFilter() async throws {
+        let sorts = SortCounter()
+        let sorter = try makeSorter(filter: { _, _ in false }, counting: sorts)
+        sorter.setChunks([try makeChunkReference(positions: [SIMD3(0, 0, 0)], chunkIndex: 0)])
+        let first = await eventually { sorts.count == 1 }
+        XCTAssertTrue(first)
+        try sorter.addChunkToSort(try makeChunkReference(positions: [SIMD3(1, 0, 0)], chunkIndex: 1))
+        let second = await eventually { sorts.count == 2 }
+        XCTAssertTrue(second)
+    }
+
+    func testCompletionHandlerGetsASortWhateverTheFilter() async throws {
+        // `SplatRenderer.afterNextSort` must not wait for a camera move once the chunk's own sort has passed.
+        let sorts = SortCounter(), handled = SortCounter()
+        let sorter = try makeSorter(filter: { _, _ in false }, counting: sorts)
+        sorter.setChunks([try makeChunkReference(positions: [SIMD3(0, 0, 0)], chunkIndex: 0)])
+        let first = await eventually { sorts.count == 1 }
+        XCTAssertTrue(first)
+        sorter.addSortCompletionHandler { handled.add() }
+        let fired = await eventually { handled.count == 1 }
+        XCTAssertTrue(fired)
+    }
+
+    func testSortLoopStopsWhenIdleAndRestarts() async throws {
+        let sorts = SortCounter()
+        let sorter = try makeSorter(filter: nil, counting: sorts)
+        sorter.setChunks([try makeChunkReference(positions: [SIMD3(0, 0, 0)], chunkIndex: 0)])
+        let first = await eventually { sorts.count == 1 }
+        XCTAssertTrue(first)
+        let stopped = await eventually { !sorter.isSortLoopRunning }
+        XCTAssertTrue(stopped, "no 1 ms polling while there is nothing to sort")
+        sorter.updateCameraPose(position: SIMD3(1, 0, 0), forward: SIMD3(0, 0, -1))
+        let second = await eventually { sorts.count == 2 }
+        XCTAssertTrue(second, "a new request restarts the loop")
+    }
 }

@@ -48,7 +48,9 @@ import Synchronization
  ## Sorting
 
  The splat sorter maintains an asynchronous sorting loop on a secondary thread, running whenever the camera
- pose or chunk data has changed since the last sort began. Each sort iteration:
+ pose or chunk data has changed since the last sort began. An optional pose filter decides whether a camera
+ pose differs enough from the last sorted one; chunk changes always sort. After about 100 ms with nothing to
+ sort the loop exits, and the next sort request starts it again. Each sort iteration:
  1. Iterates over all enabled chunks and computes depth for each splat
  2. Sorts that list by depth
  3. Writes the sorted indices (chunk index + local splat index) to a buffer, which becomes valid
@@ -82,6 +84,9 @@ class SplatSorter: @unchecked Sendable {
 
     private static var bufferCount: Int { 3 }
     private static var pollIntervalNanoseconds: UInt64 { 1_000_000 } // 1ms
+    /// Polls with nothing to sort before the sort loop exits (at least 100 ms), so a caller that requests a sort
+    /// every frame keeps one loop running instead of starting a task per frame.
+    private static var idlePollsBeforeExit: Int { 100 }
 
     // MARK: - Types
 
@@ -105,6 +110,9 @@ class SplatSorter: @unchecked Sendable {
         var pendingInvalidation: Bool = false  // If true, in-progress sort result should be marked invalid
         var cameraPose = CameraPose(position: .zero, forward: SIMD3(0, 0, -1))
         var needsSort: Bool = false
+        /// The pose the last sort started with; nil before the first and after a failed one.
+        var lastSortedPose: CameraPose? = nil
+        var sortPoseFilter: SortPoseFilterBox? = nil
         var chunks: [ChunkReference] = []
         var chunkGeneration: UInt64 = 0  // Incremented on chunk changes; prevents stale sorts from overwriting patched buffers
         var isReadingChunks: Bool = false  // True during phase 1 of sort (reading splat positions)
@@ -115,6 +123,15 @@ class SplatSorter: @unchecked Sendable {
     struct CameraPose: Equatable {
         var position: SIMD3<Float>
         var forward: SIMD3<Float>
+    }
+
+    /// Holds the pose filter, so the locked state stores a class reference instead of a function value.
+    private final class SortPoseFilterBox: Sendable {
+        let filter: @Sendable (SplatRenderer.SortPose, SplatRenderer.SortPose) -> Bool
+
+        init(_ filter: @escaping @Sendable (SplatRenderer.SortPose, SplatRenderer.SortPose) -> Bool) {
+            self.filter = filter
+        }
     }
 
     // MARK: - State
@@ -128,6 +145,18 @@ class SplatSorter: @unchecked Sendable {
     /// Called when a sort completes. The TimeInterval is the duration of the sort.
     /// Called from a background thread.
     var onSortComplete: (@Sendable (TimeInterval) -> Void)?
+
+    /// See `SplatRenderer.sortPoseFilter`.
+    var sortPoseFilter: (@Sendable (SplatRenderer.SortPose, SplatRenderer.SortPose) -> Bool)? {
+        get { state.withLock { $0.sortPoseFilter }?.filter }
+        set {
+            let box = newValue.map { SortPoseFilterBox($0) }
+            state.withLock { $0.sortPoseFilter = box }
+        }
+    }
+
+    /// Whether the background sort loop is running.
+    var isSortLoopRunning: Bool { state.withLock { $0.sortLoopRunning } }
 
     // Temporary storage for sorting (reused across iterations, only accessed from sort task)
     private var sortTempStorage: [SplatReferenceAndDepth] = []
@@ -320,13 +349,19 @@ class SplatSorter: @unchecked Sendable {
 
     // MARK: - Camera Pose Updates
 
-    /// Updates the camera pose, triggering a new sort if needed.
+    /// Updates the camera pose. A sort is requested unless the pose filter finds the last sort's order still good.
     func updateCameraPose(position: SIMD3<Float>, forward: SIMD3<Float>) {
-        state.withLock { state in
-            state.cameraPose = CameraPose(position: position, forward: forward)
+        let pending = state.withLock { state -> Bool in
+            let pose = CameraPose(position: position, forward: forward)
+            state.cameraPose = pose
+            if let box = state.sortPoseFilter, let last = state.lastSortedPose,
+               !box.filter(SplatRenderer.SortPose(last), SplatRenderer.SortPose(pose)) {
+                return state.needsSort
+            }
             state.needsSort = true
+            return true
         }
-        ensureSortLoopRunning()
+        if pending { ensureSortLoopRunning() }
     }
 
     // MARK: - Index Buffer Access (Scoped - Preferred)
@@ -406,16 +441,20 @@ class SplatSorter: @unchecked Sendable {
             state.mostRecentValidBufferIndex = nil
             state.needsSort = true
         }
+        ensureSortLoopRunning()
     }
 
     // MARK: - Sort Completion Handlers
 
-    /// Registers a one-shot handler to be called after the next successful sort completes.
+    /// Registers a one-shot handler to be called after the next successful sort completes, and requests that sort.
     /// If a sort is invalidated, the handler carries over to the next successful sort.
     /// Handlers are called outside the state lock on the sort background thread.
     func addSortCompletionHandler(_ handler: @escaping @Sendable () -> Void) {
         state.withLock { state in
             state.pendingSortCompletionHandlers.append(handler)
+            if !state.chunks.isEmpty {
+                state.needsSort = true
+            }
         }
         ensureSortLoopRunning()
     }
@@ -511,12 +550,7 @@ class SplatSorter: @unchecked Sendable {
     }
 
     private func sortLoop() async {
-        defer {
-            state.withLock { state in
-                state.sortLoopRunning = false
-            }
-        }
-
+        var idlePolls = 0
         while !Task.isCancelled {
             // Check if we need to sort
             let sortParams = state.withLock { state -> (chunks: [ChunkReference], pose: CameraPose, bufferIndex: Int, chunkGeneration: UInt64)? in
@@ -548,23 +582,28 @@ class SplatSorter: @unchecked Sendable {
                 state.sortingBufferIndex = bufferIndex
                 state.isReadingChunks = true
                 state.needsSort = false
+                state.lastSortedPose = pose
 
                 return (state.chunks, pose, bufferIndex, state.chunkGeneration)
             }
 
             guard let params = sortParams else {
-                // Nothing to sort or no buffer available, check if we should exit or wait
-                let shouldExit = state.withLock { state -> Bool in
-                    !state.needsSort && state.chunks.isEmpty
+                // With nothing to sort for `idlePollsBeforeExit` polls the loop leaves; whoever sets `needsSort`
+                // starts it again. Deciding and clearing `sortLoopRunning` under one lock leaves no gap for a
+                // request to fall into. A pending sort that waits for a buffer or exclusive access keeps polling.
+                let mayExit = idlePolls >= Self.idlePollsBeforeExit
+                let (idle, exited) = state.withLock { state -> (Bool, Bool) in
+                    guard !state.needsSort || state.chunks.isEmpty else { return (false, false) }
+                    guard mayExit else { return (true, false) }
+                    state.sortLoopRunning = false
+                    return (true, true)
                 }
-
-                if shouldExit {
-                    return
-                }
-
+                if exited { return }
+                idlePolls = idle ? idlePolls + 1 : 0
                 try? await Task.sleep(nanoseconds: Self.pollIntervalNanoseconds)
                 continue
             }
+            idlePolls = 0
 
             // Perform the sort
             await performSort(
@@ -573,6 +612,9 @@ class SplatSorter: @unchecked Sendable {
                 targetBufferIndex: params.bufferIndex,
                 chunkGeneration: params.chunkGeneration
             )
+        }
+        state.withLock { state in
+            state.sortLoopRunning = false
         }
     }
 
@@ -639,9 +681,10 @@ class SplatSorter: @unchecked Sendable {
                 )
             }
         } catch {
-            // Buffer allocation failed, abort this sort
+            // Buffer allocation failed, abort this sort; the next camera pose sorts whatever the filter
             state.withLock { state in
                 state.sortingBufferIndex = nil
+                state.lastSortedPose = nil
             }
             return
         }
@@ -689,5 +732,11 @@ private extension MTLPackedFloat3 {
 private extension SIMD3 where Scalar == Float {
     var lengthSquared: Float {
         x * x + y * y + z * z
+    }
+}
+
+extension SplatRenderer.SortPose {
+    init(_ p: SplatSorter.CameraPose) {
+        self.init(position: p.position, forward: p.forward)
     }
 }
