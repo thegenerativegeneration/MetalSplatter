@@ -531,4 +531,29 @@ extension SplatSorterTests {
         let second = await eventually { sorts.count == 2 }
         XCTAssertTrue(second, "a new request restarts the loop")
     }
+
+    func testBlockedSortWaitsForAFreeBufferPastTheIdleExit() async throws {
+        let sorts = SortCounter()
+        let sorter = try makeSorter(filter: nil, counting: sorts)
+        sorter.setChunks([try makeChunkReference(positions: [SIMD3(-5, 0, 0), SIMD3(5, 0, 0)], chunkIndex: 0)])
+        // Each sort publishes into a buffer that is neither held nor the newest; holding the first two published
+        // buffers leaves the third, the newest, as the only one without a reference.
+        var held: [MetalBuffer<ChunkedSplatIndex>] = []
+        for i in 1...3 {
+            let sorted = await eventually { sorts.count == i }
+            XCTAssertTrue(sorted)
+            let buffer = sorter.tryObtainSortedIndices()
+            XCTAssertNotNil(buffer)
+            if i < 3, let buffer { held.append(buffer) }
+            if i == 3, let buffer { sorter.releaseSortedIndices(buffer) }
+            if i < 3 { sorter.updateCameraPose(position: SIMD3(Float(i), 0, 0), forward: SIMD3(0, 0, -1)) }
+        }
+        sorter.updateCameraPose(position: SIMD3(9, 0, 0), forward: SIMD3(0, 0, -1))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(sorts.count, 3, "no free buffer: the requested sort waits")
+        XCTAssertTrue(sorter.isSortLoopRunning, "a pending sort is not idleness")
+        for buffer in held { sorter.releaseSortedIndices(buffer) }
+        let unblocked = await eventually { sorts.count == 4 }
+        XCTAssertTrue(unblocked, "the loop sorts once a buffer is free")
+    }
 }
